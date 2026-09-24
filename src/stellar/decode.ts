@@ -127,7 +127,44 @@ export interface UnknownPayload {
 
 export type EventPayload = MarketPayload | SquadPayload | UnknownPayload;
 
-export type DecodedEvent = EventMeta & { payload: EventPayload };
+export type ClaimCreatedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_created" }> };
+export type ClaimChallengedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_challenged" }> };
+export type ClaimResolvedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_resolved" }> };
+export type ClaimCancelledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "claim_cancelled" }> };
+export type MarketSettledEvent = EventMeta & { payload: Extract<MarketPayload, { name: "market_settled" }> };
+export type ChallengerPaidEvent = EventMeta & { payload: Extract<MarketPayload, { name: "challenger_paid" }> };
+export type FeeClaimedEvent = EventMeta & { payload: Extract<MarketPayload, { name: "fee_claimed" }> };
+export type WithdrawalEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal" }> };
+export type WithdrawalPendingEvent = EventMeta & { payload: Extract<MarketPayload, { name: "withdrawal_pending" }> };
+
+export type SquadMarketCreatedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "market_created" }> };
+export type SquadDepositedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "deposited" }> };
+export type SquadWithdrawnEvent = EventMeta & { payload: Extract<SquadPayload, { name: "withdrawn" }> };
+export type SquadResolvedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "resolved" }> };
+export type SquadClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "claimed" }> };
+export type SquadFeesClaimedEvent = EventMeta & { payload: Extract<SquadPayload, { name: "fees_claimed" }> };
+
+export type UnknownMarketEvent = EventMeta & { payload: UnknownPayload };
+
+export type MarketEvent =
+  | ClaimCreatedEvent
+  | ClaimChallengedEvent
+  | ClaimResolvedEvent
+  | ClaimCancelledEvent
+  | MarketSettledEvent
+  | ChallengerPaidEvent
+  | FeeClaimedEvent
+  | WithdrawalEvent
+  | WithdrawalPendingEvent
+  | SquadMarketCreatedEvent
+  | SquadDepositedEvent
+  | SquadWithdrawnEvent
+  | SquadResolvedEvent
+  | SquadClaimedEvent
+  | SquadFeesClaimedEvent
+  | UnknownMarketEvent;
+
+export type DecodedEvent = MarketEvent;
 
 // ── Scalar helpers ───────────────────────────────────────────────────────────
 
@@ -346,6 +383,7 @@ function decodeSquad(
 
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
+  if (!event) return "";
   const raw: unknown = (event as { contractId?: unknown }).contractId;
   if (typeof raw === "string") return raw;
   if (raw && typeof raw === "object") {
@@ -364,13 +402,14 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  * reason attached. A notifier must not die on an event it was not taught.
  */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
+  const closedAtMs = event?.ledgerClosedAt ? new Date(event.ledgerClosedAt).getTime() : 0;
   const meta: EventMeta = {
     source,
     contractId: contractIdOf(event),
-    ledger: Number(event.ledger ?? 0),
-    txHash: event.txHash ?? "",
-    at: Math.floor(new Date(event.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event.id ?? "",
+    ledger: Number(event?.ledger ?? 0),
+    txHash: event?.txHash ?? "",
+    at: Number.isNaN(closedAtMs) ? 0 : Math.floor(closedAtMs / 1000),
+    eventId: event?.id ?? "",
   };
 
   let eventName = "";
@@ -394,7 +433,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
         ? decodeMarket(eventName, topics, fields)
         : decodeSquad(eventName, topics, fields);
 
-    if (payload) return { ...meta, payload };
+    if (payload) return { ...meta, payload } as DecodedEvent;
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
     return {

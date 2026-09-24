@@ -58,24 +58,32 @@ interface CursorFile {
   targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
 }
 
+export interface SendOptions {
+  sendSpacingMs?: number;
+  maxSendRetries?: number;
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  sendOptions?: SendOptions;
 }
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
-const SEND_SPACING_MS = 1_500;
+const DEFAULT_SEND_SPACING_MS = 1_500;
 
 /** Maximum number of retry attempts for a single Telegram send. */
-const MAX_SEND_RETRIES = 3;
+const DEFAULT_MAX_SEND_RETRIES = 3;
 
 /** Initial backoff in milliseconds for Telegram send retries. */
-const INITIAL_BACKOFF_MS = 1_000;
+const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
 
 /** Maximum backoff in milliseconds for Telegram send retries. */
-const MAX_BACKOFF_MS = 10_000;
+const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -94,9 +102,12 @@ function errMessage(err: unknown): string {
 async function sendWithRetry(
   send: (text: string) => Promise<void>,
   text: string,
+  opts?: SendOptions,
 ): Promise<void> {
   let attempt = 0;
-  let backoff = INITIAL_BACKOFF_MS;
+  const maxRetries = opts?.maxSendRetries ?? DEFAULT_MAX_SEND_RETRIES;
+  let backoff = opts?.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
+  const maxBackoff = opts?.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
 
   while (true) {
     try {
@@ -104,7 +115,7 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
-      if (attempt >= MAX_SEND_RETRIES) {
+      if (attempt >= maxRetries) {
         throw err; // Exhausted retries
       }
       console.warn(
@@ -113,13 +124,14 @@ async function sendWithRetry(
       );
       await sleep(backoff);
       // Exponential backoff with cap
-      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      backoff = Math.min(backoff * 2, maxBackoff);
     }
   }
 }
 
 export function createPoller(deps: PollerDeps) {
-  const { config, server, send } = deps;
+  const { config, server, send, sendOptions } = deps;
+  const sendSpacing = sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -241,7 +253,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text);
+        await sendWithRetry(send, text, sendOptions);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {
@@ -253,7 +265,9 @@ export function createPoller(deps: PollerDeps) {
         );
       }
 
-      if (sentThisCycle < config.maxNotificationsPerCycle) await sleep(SEND_SPACING_MS);
+      if (sentThisCycle < config.maxNotificationsPerCycle && sendSpacing > 0) {
+        await sleep(sendSpacing);
+      }
     }
   }
 
