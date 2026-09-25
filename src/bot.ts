@@ -1,19 +1,20 @@
 /**
  * The grammy bot: commands, and the one send path the poller uses.
  *
- * The bot half is deliberately thin. It answers a handful of commands and
- * exposes `notify()`; all chain logic lives in `src/poller.ts` and
- * `src/stellar/`.
+ * The bot half is deliberately thin. It answers public status and contract
+ * commands plus operator pause/resume controls. Operator controls only change
+ * when the next polling cycle starts; they never edit cursors or touch chain
+ * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot } from "grammy";
+import { Bot, type Context } from "grammy";
 
-import { escapeMd } from "./notifications/format.js";
+import { escapeMd, safeErrorMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
-import type { PollerStatus } from "./poller.js";
+import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
-const HELP = [
+const HELP_BASE = [
   "*Mimir notifier*",
   "",
   "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
@@ -21,23 +22,44 @@ const HELP = [
   "/status — what I am watching and how far I have read",
   "/contracts — the contract ids I watch and where to look them up",
   "/help — this message",
-].join("\n");
+];
 
-function ago(timestamp: number | null): string {
+function helpMessage(config: BotConfig): string {
+  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
+  return [
+    ...HELP_BASE.slice(0, -1),
+    "/pause — operator only: pause scheduling new scans",
+    "/resume — operator only: resume polling now",
+    HELP_BASE.at(-1) as string,
+  ].join("\n");
+}
+
+const TELEGRAM_OPTIONS = {
+  parse_mode: "MarkdownV2" as const,
+  link_preview_options: { is_disabled: true },
+};
+
+function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   if (timestamp === null) return "never";
-  const seconds = Math.round((Date.now() - timestamp) / 1000);
+  const seconds = Math.max(0, Math.round((nowMs - timestamp) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
+function cursorPreview(cursor: string | null): string {
+  if (cursor === null) return "none (cold start)";
+  const compact = cursor.replace(/\s+/g, " ").replace(/[`\\]/g, "?").trim() || "empty";
+  return compact.length <= 24 ? compact : `${compact.slice(0, 23)}…`;
+}
+
 function statusMessage(config: BotConfig, status: PollerStatus): string {
   const lines: string[] = [
-    `*Status* — ${status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
+    `*Status* — ${status.paused ? "paused" : status.running ? "running" : "stopped"} on Stellar ${networkLabel(config)}`,
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
-    `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt)}`,
+    `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
     "",
     "*Watching*",
@@ -47,7 +69,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
     lines.push(
       `· mimir\\-${target.source} \`${target.contractId}\``,
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
-      `  cursor: \`${target.cursor ?? "none (cold start)"}\``,
+      `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
   }
@@ -55,7 +77,7 @@ function statusMessage(config: BotConfig, status: PollerStatus): string {
   if (status.lastError) {
     lines.push(
       "",
-      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(status.lastError.message)}`,
+      `Last error \\(${ago(status.lastError.at, nowMs)}\\): ${escapeMd(status.lastError.message)}`,
     );
   }
   if (status.consecutiveFailures > 0) {
@@ -96,43 +118,91 @@ export function contractsMessage(config: BotConfig): string {
   return lines.join("\n");
 }
 
+/** Exact operator replies, exported for deterministic Telegram payload tests. */
+export function pauseMessage(result: PollerPauseResult): string {
+  switch (result) {
+    case "paused":
+      return "*Polling paused*\nThe current scan may finish, but no new cycle will start\\. Cursors were not changed\\.";
+    case "already-paused":
+      return "*Polling is already paused*";
+    case "stopped":
+      return "*Polling cannot pause* — the process is stopping\\.";
+  }
+}
+
+export function resumeMessage(result: PollerResumeResult): string {
+  switch (result) {
+    case "resumed":
+      return "*Polling resumed*\nThe next scan starts now\\. Cursors were not changed\\.";
+    case "already-running":
+      return "*Polling is already running*";
+    case "stopped":
+      return "*Polling cannot resume* — the process is stopping\\.";
+  }
+}
+
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  pause: () => PollerPauseResult;
+  resume: () => PollerResumeResult;
 }
 
-export function createBot(deps: BotDeps): Bot {
-  const { config, status } = deps;
-  const bot = new Bot(config.botToken);
+function isOperator(ctx: Context, config: BotConfig): boolean {
+  const operatorId = config.operatorTelegramUserId;
+  return operatorId !== null && ctx.from?.id.toString() === operatorId;
+}
+
+/** Register command handlers on a grammy-compatible bot (also useful in tests). */
+export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
+  const { config, status, pause, resume } = deps;
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(HELP, { parse_mode: "MarkdownV2" });
+    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
   });
 
   bot.command("status", async (ctx) => {
-    await ctx.reply(statusMessage(config, status()), {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
   });
 
   // Config-only, so this never fails on account of poller or RPC state —
   // unlike /status, it has nothing to report failure on.
   bot.command("contracts", async (ctx) => {
-    await ctx.reply(contractsMessage(config), {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
   });
 
+  bot.command("pause", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
+      return;
+    }
+    await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+  });
+
+  bot.command("resume", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
+      return;
+    }
+    await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
+  });
+}
+
+export function createBot(deps: BotDeps): Bot {
+  const bot = new Bot(deps.config.botToken);
+  registerCommandHandlers(bot, deps);
+
   // grammy rethrows handler errors by default, which would take the process
-  // with it. A malformed command must not be fatal.
+  // with it. Keep Telegram/RPC error text bounded and redact known secrets.
   bot.catch((err) => {
-    console.error(`[bot] handler error on update ${err.ctx.update.update_id}:`, err.error);
+    console.error(
+      `[bot] handler error on update ${err.ctx.update.update_id}: ` +
+        safeErrorMessage(err.error, [deps.config.botToken]),
+    );
   });
 
   return bot;
@@ -141,10 +211,7 @@ export function createBot(deps: BotDeps): Bot {
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    await bot.api.sendMessage(config.chatId, text, TELEGRAM_OPTIONS);
   };
 }
 
@@ -156,9 +223,12 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "help", description: "Show help" },
       { command: "status", description: "Last-seen ledger and watched contracts" },
       { command: "contracts", description: "Contract ids and explorer links" },
+      { command: "pause", description: "Operator only: pause new scans" },
+      { command: "resume", description: "Operator only: resume polling now" },
     ]);
   } catch (err) {
-    // Cosmetic. Never worth failing a boot over.
-    console.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
+    // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.
+    console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);
   }
 }
+
