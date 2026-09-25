@@ -92,27 +92,67 @@ export type MarketPayload =
   | { name: "withdrawal"; to: string; amount: bigint }
   | { name: "withdrawal_pending"; to: string; amount: bigint };
 
+export type SquadMarketCreatedPayload = {
+  name: "market_created";
+  marketId: number;
+  captain: string;
+  deadline: number;
+  feeBps: number;
+  question: string;
+};
+
+export type SquadDepositedPayload = {
+  name: "deposited";
+  marketId: number;
+  side: number;
+  participant: string;
+  amount: bigint;
+  shares: bigint;
+};
+
+export type SquadWithdrawnPayload = {
+  name: "withdrawn";
+  marketId: number;
+  side: number;
+  participant: string;
+  amount: bigint;
+};
+
+export type SquadResolvedPayload = {
+  name: "resolved";
+  marketId: number;
+  result: number;
+  poolA: bigint;
+  poolB: bigint;
+};
+
+export type SquadClaimedPayload = {
+  name: "claimed";
+  marketId: number;
+  participant: string;
+  gross: bigint;
+  fee: bigint;
+  net: bigint;
+};
+
+export type SquadFeesClaimedPayload = {
+  name: "fees_claimed";
+  recipient: string;
+  amount: bigint;
+};
+
 export type SquadPayload =
-  | {
-      name: "market_created";
-      marketId: number;
-      captain: string;
-      deadline: number;
-      feeBps: number;
-      question: string;
-    }
-  | {
-      name: "deposited";
-      marketId: number;
-      side: number;
-      participant: string;
-      amount: bigint;
-      shares: bigint;
-    }
-  | { name: "withdrawn"; marketId: number; side: number; participant: string; amount: bigint }
-  | { name: "resolved"; marketId: number; result: number; poolA: bigint; poolB: bigint }
-  | { name: "claimed"; marketId: number; participant: string; gross: bigint; fee: bigint; net: bigint }
-  | { name: "fees_claimed"; recipient: string; amount: bigint };
+  | SquadMarketCreatedPayload
+  | SquadDepositedPayload
+  | SquadWithdrawnPayload
+  | SquadResolvedPayload
+  | SquadClaimedPayload
+  | SquadFeesClaimedPayload;
+
+export type SquadEvent = EventMeta & {
+  source: "squad";
+  payload: SquadPayload | UnknownPayload;
+};
 
 /**
  * Anything this bot has no notification for: admin events (`oracle_changed`,
