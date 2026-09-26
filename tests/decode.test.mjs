@@ -466,6 +466,39 @@ test("decodeEvent: fee_policy_changed decodes into admin payload", () => {
   assert.equal(audit.details.feeBps, 500);
 });
 
+test("malformed XDR in admin event returns unknown payload with bounded reason without throwing", () => {
+  const malformedAdminEvent = {
+    id: "99-0",
+    contractId: "C1",
+    ledger: 99,
+    txHash: "aabbcc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("oracle_changed")],
+    value: "not-an-scval-map",
+  };
+
+  let decoded;
+  assert.doesNotThrow(() => {
+    decoded = decodeEvent("market", malformedAdminEvent);
+  });
+  assert.equal(decoded.payload.name, "unknown");
+  assert.equal(decoded.payload.eventName, "oracle_changed");
+  assert.ok(typeof decoded.payload.reason === "string");
+  assert.ok(decoded.payload.reason.length <= 200);
+
+  const validEvent = {
+    id: "100-0",
+    contractId: "C1",
+    ledger: 100,
+    txHash: "aabbcc",
+    ledgerClosedAt: "2026-01-01T00:00:00Z",
+    topic: [scStr("oracle_changed"), scAddress(ADDR)],
+    value: nativeToScVal({}),
+  };
+  const validDecoded = decodeEvent("market", validEvent);
+  assert.equal(validDecoded.payload.name, "oracle_changed");
+});
+
 test("toAdminAuditRecord returns null for user events", () => {
   const raw = {
     id: "10-0",
