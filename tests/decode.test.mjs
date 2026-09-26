@@ -9,7 +9,7 @@
  *   - Wrong-type fields
  *   - Oversized strings (clip() in formatEvent)
  *   - Unknown event names (no decoder)
- *   - Admin events that are real but have no notification
+ *   - Admin events that are decoded into structured audit records
  *   - Both market and squad sources
  *   - Helpers: formatUsdc, shortAddress, winnerSideLabel, squadSideLabel
  */
