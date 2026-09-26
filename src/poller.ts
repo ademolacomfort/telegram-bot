@@ -1045,8 +1045,9 @@ export function createPoller(deps: PollerDeps) {
         if (!current) continue;
 
         // Per-target RPC backoff check: skip if in backoff window
-        if (current.nextEligibleAt !== null && now() < current.nextEligibleAt) {
-          const remainingMs = current.nextEligibleAt - now();
+        const currentTime = now();
+        if (current.nextEligibleAt !== null && currentTime < current.nextEligibleAt) {
+          const remainingMs = current.nextEligibleAt - currentTime;
           console.log(
             `[poller] ${target.source}: skipping RPC scan (in backoff for another ${Math.ceil(remainingMs / 1000)}s)`,
           );
