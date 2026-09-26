@@ -67,6 +67,10 @@ export interface TargetState {
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
   lastError: string | null;
+  /** Number of consecutive RPC failures for this specific target. */
+  consecutiveFailures: number;
+  /** Timestamp (unix ms) before which this target will skip RPC scanning. */
+  nextEligibleAt: number | null;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
@@ -207,6 +211,15 @@ export interface SendOptions {
   maxBackoffMs?: number;
 }
 
+export interface TargetBackoffOptions {
+  /** Initial backoff delay in ms after first RPC failure for a target. Defaults to 1_000ms. */
+  initialBackoffMs?: number;
+  /** Maximum backoff delay in ms for a target. Defaults to 60_000ms. */
+  maxBackoffMs?: number;
+  /** Exponential backoff factor. Defaults to 2. */
+  backoffFactor?: number;
+}
+
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
@@ -217,6 +230,8 @@ export interface PollerDeps {
    */
   send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
   sendOptions?: SendOptions;
+  /** Per-target RPC backoff configuration */
+  targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
   /** Clock behind every timestamp this poller reports. Defaults to `Date.now`. */
@@ -249,6 +264,15 @@ export interface CircuitBreakerOptions {
   /** Milliseconds to wait before attempting to close the circuit */
   cooldownMs?: number;
 }
+
+/** Default initial backoff in milliseconds for per-target RPC backoff. */
+const DEFAULT_TARGET_INITIAL_BACKOFF_MS = 1_000;
+
+/** Default maximum backoff in milliseconds for per-target RPC backoff. */
+const DEFAULT_TARGET_MAX_BACKOFF_MS = 60_000;
+
+/** Default backoff factor for per-target RPC backoff. */
+const DEFAULT_TARGET_BACKOFF_FACTOR = 2;
 
 /** Default number of consecutive RPC failures before opening the circuit. */
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5;
@@ -653,6 +677,9 @@ export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
+  const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? DEFAULT_TARGET_INITIAL_BACKOFF_MS;
+  const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
+  const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
@@ -673,7 +700,15 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      {
+        source: t.source,
+        contractId: t.contractId,
+        cursor: null,
+        lastEventLedger: null,
+        lastError: null,
+        consecutiveFailures: 0,
+        nextEligibleAt: null,
+      },
     ]),
   );
 
@@ -1009,6 +1044,15 @@ export function createPoller(deps: PollerDeps) {
         const current = state.get(target.source);
         if (!current) continue;
 
+        // Per-target RPC backoff check: skip if in backoff window
+        if (current.nextEligibleAt !== null && now() < current.nextEligibleAt) {
+          const remainingMs = current.nextEligibleAt - now();
+          console.log(
+            `[poller] ${target.source}: skipping RPC scan (in backoff for another ${Math.ceil(remainingMs / 1000)}s)`,
+          );
+          continue;
+        }
+
         try {
           const window = dedup.get(target.source) ?? new EventDedupWindow(0);
           const scan = await withTimeout(
@@ -1025,6 +1069,8 @@ export function createPoller(deps: PollerDeps) {
           status.latestLedger = scan.latestLedger;
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
+          current.consecutiveFailures = 0;
+          current.nextEligibleAt = null;
           anyOk = true;
 
           // Advance the chain clock from close times the RPC actually reported.
@@ -1105,10 +1151,18 @@ export function createPoller(deps: PollerDeps) {
           }
         } catch (err) {
           cycleFailures++;
+          current.consecutiveFailures += 1;
+          const delayMs = Math.min(
+            targetInitialBackoff * Math.pow(targetBackoffFactor, current.consecutiveFailures - 1),
+            targetMaxBackoff,
+          );
+          current.nextEligibleAt = now() + delayMs;
           const message = errorMessage(err);
           current.lastError = message;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
-          console.error(`[poller] ${target.source} scan failed: ${message}`);
+          console.error(
+            `[poller] ${target.source} scan failed (failure #${current.consecutiveFailures}, backoff ${delayMs}ms): ${message}`,
+          );
           if (isStaleCursorError(message)) {
             // Cursor semantics stay loss-free: the cursor is NOT advanced here.
             // Only bounded metadata is logged — never the cursor file path

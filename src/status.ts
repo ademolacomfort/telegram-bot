@@ -72,6 +72,8 @@ export interface StatusTargetSnapshot {
   cursor: string | null;
   lastEventLedger: number | null;
   lastError: string | null;
+  consecutiveFailures: number;
+  nextEligibleAt: number | null;
 }
 
 export interface StatusSnapshot {
@@ -136,6 +138,8 @@ export function buildStatusSnapshot(
       cursor: target.cursor === null ? null : boundText(target.cursor, MAX_CURSOR_CHARS),
       lastEventLedger: target.lastEventLedger,
       lastError: target.lastError === null ? null : boundText(target.lastError),
+      consecutiveFailures: target.consecutiveFailures ?? 0,
+      nextEligibleAt: target.nextEligibleAt ?? null,
     })),
   };
 }
