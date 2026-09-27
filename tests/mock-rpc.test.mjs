@@ -446,7 +446,7 @@ test("injected JSON-RPC failures stay bounded, redacted, and recover", async () 
     assert.ok(
       cap
         .text()
-        .includes("[poller] market scan failed: -32603: injected mock getEvents failure: error"),
+        .includes("[poller] market scan failed (failure #1, backoff 25ms): -32603: injected mock getEvents failure: error"),
     );
 
     // Failure budget spent; clear the injection and the very next cycle must
