@@ -202,6 +202,7 @@ const DEFAULTS = {
   lockFile: "./data/poller.lock",
   statusFile: "./data/status.json",
   maxNotificationsPerCycle: 20,
+  auditFile: "./data/audit.jsonl",
   dedupWindow: 256,
   healthHost: "127.0.0.1",
   healthPort: 8787,

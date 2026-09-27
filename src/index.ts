@@ -47,6 +47,13 @@ function installProcessHandlers(): void {
   });
 }
 
+/** Redacted shutdown marker: what stopped the process, and nothing else. */
+function auditShutdownEntry(signal: string) {
+  return auditEntry("shutdown", {
+    detail: `stopped by ${signal === "SIGTERM" ? "SIGTERM" : "SIGINT"}`,
+  });
+}
+
 /**
  * `--status` prints the last snapshot written by a running (or stopped) bot and
  * exits. It reads the file only — it never contacts Telegram or the RPC — so it
@@ -144,10 +151,22 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
-  const poller = createPoller({ config, server, send: (text, source, extra) => notify(text, source, extra) });
+  const audit = createAuditLog();
+  audit.record(
+    auditEntry("boot", {
+      detail: `network=${networkLabel(config)} poll=${config.pollIntervalMs}ms`,
+    }),
+  );
+  const poller = createPoller({
+    config,
+    server,
+    send: (text, source, extra) => notify(text, source, extra),
+    audit,
+  });
   const bot = createBot({
     config,
     status: () => poller.status(),
+    audit,
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
@@ -197,6 +216,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`[shutdown] ${signal} received, draining`);
 
+    // A clean-stop marker closes the audit window: anything after it belongs to
+    // the next run, which is how an operator tells a crash from a restart.
+    poller.audit.record(auditShutdownEntry(signal));
+
     // The drain is already bounded by SHUTDOWN_TIMEOUT_MS; this covers the
     // teardown after it (health socket, grammy stop) so a wedged close cannot
     // outlive the deploy. The cursor flush happens before either, so an exit
@@ -234,6 +257,9 @@ async function main(): Promise<void> {
           `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
         );
       }
+
+      // Flush last so entries recorded while stopping are persisted.
+      await poller.flushAuditFile().catch(() => undefined);
       process.exit(0);
     })();
   };
