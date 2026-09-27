@@ -365,6 +365,19 @@ Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see
 [docs/contributor-fixtures.md](docs/contributor-fixtures.md)).
 
+For local restart and regression checks without Testnet or Telegram credentials,
+seed that file with a deterministic fixture:
+
+```bash
+npm run seed:cursor                 # writes ./data/cursor.json (refuses overwrite)
+npm run seed:cursor -- --force      # replace an existing file
+npm run seed:cursor -- --empty      # null cursors (file present, cold resume)
+npm run seed:cursor -- --out /tmp/cursor.json
+```
+
+The seeder uses the same write-then-rename discipline as the poller, never reads
+bot tokens or signing keys, and refuses cursor values that look like secrets.
+
 If the file exists but is corrupt (truncated JSON, wrong `version`, or a
 non-object `targets` map), the poller renames it to
 `CURSOR_FILE.corrupt.<ISO-timestamp>` and cold-starts. That keeps the bad file
@@ -535,6 +548,11 @@ cursor file if you want an exact resume point.
 
 ## Health endpoint
 
+Before the poller starts, boot calls Soroban RPC `getHealth()` with bounded
+retries (`STARTUP_HEALTH_DEADLINE_MS` / `STARTUP_HEALTH_RETRY_MS`) so a brief
+RPC outage does not abort startup, while a bad URL still fails within the
+deadline.
+
 The process exposes a **loopback HTTP** probe for supervisors and deploy
 checks (default `http://127.0.0.1:8787`):
 
@@ -550,11 +568,63 @@ bot's clock and the newest chain close time it has observed — positive while t
 bot is ahead). It never includes `BOT_TOKEN`, chat ids, private keys, or
 unbounded remote payloads.
 
+### Configuration provenance
+
+`GET /health` also answers *where each setting's value came from*, and never what
+it is. That distinction is the difference between "the bot is configured" and
+"the bot is configured the way I think it is": a placeholder token inherited from
+a profile, a `.env` the process never found because it started from another
+directory, and a variable exported empty all look identical from the outside.
+
+```json
+{
+  "config": {
+    "profile": null,
+    "envFile": { "present": true, "suppliedKeys": 12 },
+    "entries": [
+      { "key": "BOT_TOKEN", "source": "env-file", "secret": true },
+      { "key": "HEALTH_PORT", "source": "derived", "derivedFrom": "PORT", "secret": false }
+    ],
+    "counts": {
+      "process-env": 3,
+      "env-file": 12,
+      "profile-default": 0,
+      "built-in-default": 6,
+      "derived": 1,
+      "unset": 4
+    },
+    "warnings": []
+  }
+}
+```
+
+`source` is one of `process-env`, `env-file`, `profile-default`,
+`built-in-default`, `derived` (another setting supplies it, named by
+`derivedFrom`), or `unset` — absent and optional, which is the normal state for
+`ALLOWED_CHAT_IDS` and `OPERATOR_TELEGRAM_USER_ID`. No value — token, chat id, or
+anything else — is ever part of the report, so it can be pasted into a ticket
+as-is; `secret: true` marks the settings that are sensitive for exactly that
+reason. `warnings` names what is worth acting on: a variable set but empty, a
+`.env` that supplies none of the known settings (usually a working-directory
+bug), an unknown `MIMIR_PROFILE`, or the mock profile being active.
+
+Boot logs the same information as one line, followed by any warnings:
+
+```
+[boot] config       profile=none env-file=present(12 keys) process-env=3 env-file=12 built-in-default=6 derived=1 unset=4 secret-keys=6/26
+[boot] config       HEALTH_STALE_MS is set but empty; the built-in default supplies the value
+```
+
+`/status` ends with the same one-line summary, so an operator can confirm which
+`.env` a deployment actually read without opening a shell.
+
 Configuration (see `.env.example`):
 
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
+- `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the health module is additive and does not change
@@ -563,6 +633,7 @@ cursor format or Telegram behaviour.
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
+- **Notification feature flags** (`NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`) are coarse kill switches for Telegram posts. Disabled events are skip-logged and the cursor still advances; unset defaults keep prior always-on behavior.
 
 ## Layout
 
@@ -577,6 +648,8 @@ src/
   poller.ts                the loop: scan, notify, persist the cursor
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
+  dev/
+    seedCursor.ts          credential-free local cursor seeder (npm run seed:cursor)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
@@ -631,7 +704,8 @@ truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, health and lockfile suites, or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run seed:cursor` to write a local cursor fixture.
 
 ### Lockfile reproducibility
 
@@ -654,7 +728,7 @@ drift is caught locally without network access. To change dependencies, edit
 `package.json`, run `npm install` to regenerate the lockfile, and commit both
 files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 
