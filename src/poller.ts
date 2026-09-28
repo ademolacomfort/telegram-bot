@@ -318,9 +318,6 @@ export interface CircuitBreakerOptions {
   cooldownMs?: number;
 }
 
-/** Default initial backoff in milliseconds for per-target RPC backoff. */
-const DEFAULT_TARGET_INITIAL_BACKOFF_MS = 1_000;
-
 /** Default maximum backoff in milliseconds for per-target RPC backoff. */
 const DEFAULT_TARGET_MAX_BACKOFF_MS = 60_000;
 
@@ -878,24 +875,9 @@ export function createPoller(deps: PollerDeps) {
   const audit: AuditLog = deps.audit ?? createAuditLog();
   const sendSpacing = deps.sendOptions?.sendSpacingMs ?? DEFAULT_SEND_SPACING_MS;
   const now = deps.now ?? Date.now;
-  const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? Math.min(config.pollIntervalMs, DEFAULT_TARGET_INITIAL_BACKOFF_MS);
+  const targetInitialBackoff = deps.targetBackoffOptions?.initialBackoffMs ?? config.pollIntervalMs;
   const targetMaxBackoff = deps.targetBackoffOptions?.maxBackoffMs ?? DEFAULT_TARGET_MAX_BACKOFF_MS;
   const targetBackoffFactor = deps.targetBackoffOptions?.backoffFactor ?? DEFAULT_TARGET_BACKOFF_FACTOR;
-
-  let lastCycleTime: number | null = null;
-
-  function getCycleTime(): number {
-    const realNow = now();
-    if (deps.now) {
-      return realNow;
-    }
-    if (lastCycleTime === null) {
-      lastCycleTime = realNow;
-    } else {
-      lastCycleTime = Math.max(realNow, lastCycleTime + config.pollIntervalMs);
-    }
-    return lastCycleTime;
-  }
   const circuitThreshold = deps.circuitBreakerOptions?.failureThreshold ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
   const circuitCooldown = deps.circuitBreakerOptions?.cooldownMs ?? DEFAULT_CIRCUIT_COOLDOWN_MS;
   const errorMessage = (err: unknown): string => safeErrorMessage(err, [config.botToken]);
@@ -1392,7 +1374,7 @@ export function createPoller(deps: PollerDeps) {
     let explicitBackoff: number | null = null;
     beginCycleTracking();
     status.cycles += 1;
-    const currentTime = getCycleTime();
+    const currentTime = now();
     status.lastPollAt = currentTime;
 
     // ── Circuit breaker check ─────────────────────────────────────────────────────
