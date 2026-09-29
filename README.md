@@ -108,20 +108,12 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip/dedup counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send/skip counters (plus messages dropped by a shutdown drain and cursors automatically rewound to the retained floor), and the last error |
 | `/audit` | Operator only. The operator audit report: recent scan failures, send failures, skipped and cap-dropped events, cursor problems — redacted and bounded (see [Operator audit trail](#operator-audit-trail)) |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
-
-`/start`, `/help`, and Telegram's command menu are generated from the same
-command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
-the help and menu omit `/audit`, `/pause`, and `/resume`; configured operator
-commands are labelled "Operator only". Help uses static metadata, so it remains
-available when the poller or RPC is unhealthy. Adding a command requires its
-metadata and handler in `src/bot.ts`; TypeScript checks that every registry entry
-has a handler. This changes no cursor files or deployment settings.
 
 Commands from a user other than `OPERATOR_TELEGRAM_USER_ID` receive no control
 response and cannot mutate poller state — this includes `/audit`, whose report
@@ -158,7 +150,6 @@ npm start -- --status          # or: node dist/index.js --status
   "notificationsSent": 11,
   "notificationsFailed": 0,
   "eventsSkipped": 3,
-  "eventsDeduplicated": 0,
   "cursorRewinds": 0,
   "consecutiveFailures": 0,
   "lastError": null,
@@ -216,98 +207,6 @@ stays valid. Each target reports its `startLedger` and `startClamped`, so it is
 clear when a requested `--from` was moved up to the retained floor. Neither mode
 prints bot tokens or signing keys — the scanner never holds them. This is how the
 decoder was verified against the live deployment.
-
-## Cursor-range replay
-
-Replay reads a fixed ledger range from the chain and optionally re-posts the
-events to Telegram. It is one-shot: it exits when the range is exhausted and
-**never writes a cursor file** — the live poller's cursor state is untouched.
-
-```bash
-npm run replay -- --from 4226500                 # dry-run: decode only, no send
-npm run replay -- --from 4226500 --to 4226800    # bounded range
-npm run replay -- --from 4226500 --send          # send to Telegram (needs BOT_TOKEN)
-npm run replay -- --from 4226500 --contract market  # one contract only
-npm run replay -- --from 4226500 --json          # machine-readable mimir-replay-v1
-npm run replay -- --from 4226500 --pages 5       # walk at most 5 pages per contract
-npm run replay -- --from 4226500 --cap 10        # cap at 10 notifications per contract
-npm run replay:mock -- --from 4226500            # local mock profile, no credentials
-```
-
-**Flags:**
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--from <ledger\|cursor>` | (required) | Start of the range — a ledger number or an opaque RPC cursor |
-| `--to <ledger>` | chain tip | End of the range (inclusive). Clamped to the tip when above it |
-| `--send` | off | Actually post to Telegram; requires `BOT_TOKEN` and `TELEGRAM_CHAT_ID` |
-| `--contract market\|squad` | both | Scan only the named contract |
-| `--pages <n>` | 20 | Page budget per contract |
-| `--cap <n>` | `MAX_NOTIFICATIONS_PER_CYCLE` | Maximum notifications per contract per run |
-| `--show <n>` | 0 | Include the last *n* decoded events per target in the report |
-| `--json` | off | Machine-readable `mimir-replay-v1` JSON on stdout; progress on stderr |
-| `--mock` | off | `MIMIR_PROFILE=mock`: local RPC, fixture contracts, no credentials needed |
-
-**Default mode is dry-run.** Events are decoded and counted; nothing is posted to
-Telegram. Add `--send` to deliver notifications. The run always exits with code
-`0` on completion, `1` on a fatal RPC or config error, and `2` on a bad flag.
-
-**Cursor clamping.** `--from` below the RPC's retained floor is moved up to the
-floor with a warning. `--to` above the chain tip is clamped to the tip. A `--to`
-before `--from` is a usage error (exit 2). Neither clamp changes the live
-poller's cursor.
-
-**Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
-are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are counted as skipped and do not abort the
-run. No bot token or private key ever appears in progress output or the JSON
-report.
-
-**JSON report shape** (`--json` stdout, one document, ends with `\n`):
-
-```json
-{
-  "format": "mimir-replay-v1",
-  "network": "testnet",
-  "rpcUrl": "https://soroban-testnet.stellar.org",
-  "fromLedger": 4226500,
-  "toLedger": 4226800,
-  "dryRun": true,
-  "targets": [
-    {
-      "source": "market",
-      "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-      "fromLedger": 4226500,
-      "toLedger": 4226800,
-      "startLedger": 4226500,
-      "startClamped": false,
-      "pages": 3,
-      "events": 2,
-      "sent": 0,
-      "skipped": 0,
-      "capped": 0,
-      "adminLogged": 0,
-      "duplicates": 0,
-      "truncated": false,
-      "lastEventLedger": 4226729,
-      "cursor": "0018276211125911551-4294967295",
-      "eventLog": []
-    }
-  ],
-  "totals": {
-    "events": 2,
-    "sent": 0,
-    "skipped": 0,
-    "capped": 0,
-    "adminLogged": 0,
-    "duplicates": 0
-  }
-}
-```
-
-`bigint` amounts are serialized as decimal strings (same convention as
-`mimir-scan-v1`), so `npm run replay -- --json | jq` is valid. Progress and
-warnings always go to stderr.
 
 ## Operator audit trail
 
@@ -373,22 +272,6 @@ exercises the poller's cursor-safety, restart, and bounded-log guarantees end to
 end. `npm test` covers all of it (`tests/mock-*.test.mjs`); run just those with
 `npm run test:mock`.
 
-
-## Decoded event payload caps
-
-Each Soroban event is size-checked **before** native decoding in
-`src/stellar/decode.ts`:
-
-| Cap | Default | Failure mode |
-|---|---|---|
-| Event `value` XDR | 16 KiB (`MAX_DECODED_EVENT_XDR_BYTES`) | Event becomes `unknown` with a short reason; cursor still advances |
-| Per-topic XDR | 1 KiB (`MAX_EVENT_TOPIC_XDR_BYTES`) | Same |
-| Decoded string field | 2048 chars (`MAX_DECODED_STRING_CHARS`) | Same |
-
-Oversized or malformed events never crash the poller and are never re-logged as
-raw remote bytes — only a truncated reason string is kept. No configuration
-change is required; existing cursors remain valid.
-
 ## How the polling works
 
 Soroban's `getEvents` is **not** `eth_getLogs`, and the difference is the whole
@@ -424,34 +307,12 @@ unguarded, one on-chain event becomes two identical chat messages.
 The reader and the poller therefore share a small, bounded **dedup window**
 (`src/dedup.ts`): the ids of the most recently processed events per contract,
 oldest evicted first. A redelivery inside that window is dropped and counted
-instead of posted — visible as `duplicates=` in `npm run scan` output, as
-`eventsDeduplicated` on `GET /health` and in `status.json`, and as `deduped` in
-`/status`. The window is seeded into every scan from the cursor file, so the
-guard survives a restart, and it never grows with chain history: an event older
-than the window can legitimately be announced again, which is the accepted
-trade-off for O(1) memory and a cursor file that stays small. Set
-`EVENT_DEDUP_WINDOW=0` to disable suppression.
-
-**One event, one key.** Window membership is decided by a single canonical key
-(`eventKey()` in `src/dedup.ts`), derived in strict order:
-
-1. The RPC's own paging token `id` (`<TOID>-<index>`) when present — unique per
-   event and stable across pagination; used verbatim so ids persisted by older
-   releases keep working unchanged.
-2. The same token under the name `eventId`.
-3. A content-derived composite `v2:<ledger>:<txHash>:<txIndex>:<opIndex>:<digest>`
-   when a response omits both — chain positions plus a fixed-length SHA-256
-   digest of the topic XDR. Two events share this key only when every
-   identity-bearing field agrees, so events emitted by the same transaction
-   (even the same operation) are never falsely merged.
-4. Otherwise `null`: no `txHash`, or topic content that cannot be encoded
-   deterministically. Those events pass through **undeduplicated** rather than
-   risk suppressing a real one — a duplicate is recoverable, a wrongly dropped
-   event is not.
-
-The scanner, the poller, and `npm run replay` all route through this one
-function, so an event is never identified one way in one place and another way
-somewhere else.
+instead of posted — visible as `duplicates=` in `npm run scan` output and as
+`eventsDeduplicated` on `/health`. The window is seeded into every scan from the
+cursor file, so the guard survives a restart, and it never grows with chain
+history: an event older than the window can legitimately be announced again,
+which is the accepted trade-off for O(1) memory and a cursor file that stays
+small. Set `EVENT_DEDUP_WINDOW=0` to disable suppression.
 
 This is suppression, not backfilling. A dropped duplicate does **not** hold the
 cursor back — the chain remains the record and the walk still advances.
@@ -482,26 +343,6 @@ The poller now recovers from exactly that case, without guessing:
 - It is **conservative**: an opaque cursor this build cannot place, a cursor
   ahead of the tip, or a window that cannot be read is left untouched and the
   bounded RPC error is surfaced. Nothing is rewritten on a hunch.
-- A stale rejection immediately marks that target `cursorStale` in
-  `status.json` and `GET /health`, and makes readiness return `503` until that
-  target completes a successful scan. `/status` and `/health` identify whether
-  the cursor is unchanged or a retained-floor recovery is underway. The alert
-  is reconstructed after restart from the persisted rewind position or the
-  next RPC rejection; the version-1 cursor schema does not change.
-- Railway's configured `GET /health` deployment probe therefore remains
-  unready while a stale cursor is unresolved. Recovery continues in-process;
-  do not delete or replace the persistent cursor volume to force readiness.
-  `GET /health/live` stays `200` for supervisors that need process liveness
-  independently of readiness.
-- A cursor that simply **never advances** is the other half of the story: the
-  scan keeps succeeding, so no error counter moves, yet the walk is behind the
-  tip and never closes the gap. After `CURSOR_STALL_CYCLES` (5) such cycles with
-  a lag of at least `CURSOR_STALL_MIN_LAG_LEDGERS` (2) ledgers, the poller logs
-  a `CURSOR STALLED` warning once, `/status` gains a `cursor stalled:` line, and
-  `/health` reports `cursorStalled` per target and becomes `degraded`. Sitting
-  at or within a ledger of the tip is healthy idling and never counts, and a
-  cold start's first cursor is progress, not a stall. Nothing is rewritten: the
-  cursor file is left intact and the bot keeps retrying.
 - The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
   retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
   expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
@@ -571,15 +412,9 @@ treatment as the cursor:
 `recentEventIds` is the persisted **dedup window** (see
 [Overlapping pages and duplicate events](#overlapping-pages-and-duplicate-events))
 and is additive: it is bounded by `EVENT_DEDUP_WINDOW` (default `256`) and older
-cursor files without the field load as an empty window. Entries are the
-canonical dedup keys: mostly raw RPC paging tokens, but a `v2:` prefix marks a
-content-derived composite for a response that arrived without one. Both forms
-round-trip as opaque strings across restarts, and mixed generations coexist
-harmlessly — a file written by an older release may still hold its
-`<ledger>:<txHash>:<count>` strings, which simply age out of the bounded window
-as new keys are added. No schema bump and no migration are involved. The
-`version` and the `cursor` / `lastEventLedger` fields are unchanged, so the
-format stays backward-compatible in both directions.
+cursor files without the field load as an empty window. The `version` and the
+`cursor` / `lastEventLedger` fields are unchanged, so the format stays
+backward-compatible in both directions.
 
 `rewindFromLedger` is a second additive field, written **only while a target is
 recovering from a stale cursor** (see
@@ -826,10 +661,8 @@ cursors, whether a target has an error, automatic floor rewinds
 (`poller.cursorRewinds` plus each target's `rewindFromLedger`), and the chain
 clock (`poller.chainClockAt` plus `poller.chainClockSkewMs`, the signed difference
 in milliseconds between the bot's clock and the newest chain close time it has
-observed — positive while the bot is ahead). Each target's `cursorStale` boolean
-indicates an unresolved RPC rejection; resolving it requires a successful scan,
-not a health-probe retry or local cursor-age guess. It never includes
-`BOT_TOKEN`, chat ids, private keys, or unbounded remote payloads.
+observed — positive while the bot is ahead). It never includes `BOT_TOKEN`, chat
+ids, private keys, or unbounded remote payloads.
 
 ### Configuration provenance
 
@@ -886,14 +719,12 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
-- A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
-redeploy the previous image — the target alert is additive, does not change the
-version-1 cursor format or Telegram delivery, and the previous build safely
-ignores the new status field.
+redeploy the previous image — the health module is additive and does not change
+cursor format or Telegram behaviour.
 
 **Failure modes:** binding fails only if the port is already taken (process
 exits via the listen error path after logging). Client disconnects and probe
@@ -909,11 +740,10 @@ src/
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
-  dedup.ts                 canonical event dedup keys (eventKey) + bounded window
+  dedup.ts                 bounded event-id window (reader + poller dedup)
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
-  replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)
   instanceLock.ts          exclusive process lock for the cursor owner
   status.ts                machine-readable status snapshot (allowlisted, bounded)
   dev/
@@ -922,7 +752,6 @@ src/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
     decode.ts              typed decoding of both contracts' events
-    replay.ts              cursor-range replay engine + runReplayCli() (npm run replay)
     mock-rpc.ts            local Soroban mock: scenario, pagination, failure injection
     mock-constants.ts      mock profile fixture ids, ports, placeholder credentials
   notifications/
@@ -930,7 +759,6 @@ src/
 tests/
   format.test.mjs          notification formatting (incl. deterministic fuzz)
   audit.test.mjs           redaction, entries, persistence, report rendering
-  replay.test.mjs          cursor-range replay: dry-run, send, clamp, security, cursor-safety
 ```
 
 ## Deploying on Railway

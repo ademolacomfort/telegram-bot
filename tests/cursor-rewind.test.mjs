@@ -476,11 +476,9 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
       }),
       "utf8",
     );
-    let releaseScan;
-    const heldScan = new Promise((resolve) => {
-      releaseScan = resolve;
+    const server = makeServer({
+      onEvents: () => ({ events: [], cursor: makeCursor(TIP), latestLedger: TIP }),
     });
-    const server = makeServer({ onEvents: () => heldScan });
     const poller = createPoller({
       config: makeConfig(cursorFile),
       server,
@@ -488,21 +486,17 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
       now: fakeClock(),
     });
     await captureLogs(async () => {
-      const started = poller.start();
+      await poller.start();
       try {
         await until(
           () => server.requests.some((req) => req.startLedger === FLOOR),
           "floor walk after restart",
         );
-        assert.equal(targetOf(poller, "market").cursorStale, true, "saved rewind restores the alert");
-        releaseScan({ events: [], cursor: makeCursor(TIP), latestLedger: TIP });
         await until(
           () => targetOf(poller, "market").rewindFromLedger === null,
           "restart rewind completed",
         );
-        await started;
       } finally {
-        releaseScan({ events: [], cursor: makeCursor(TIP), latestLedger: TIP });
         poller.stop();
       }
     });
@@ -514,7 +508,6 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
     );
     assert.equal(poller.status().cursorRewinds, 0, "a reloaded hint is not a new rewind");
     assert.equal(targetOf(poller, "market").cursor, makeCursor(TIP));
-    assert.equal(targetOf(poller, "market").cursorStale, false, "successful scan clears the alert");
   }));
 
 // ── Bounded: a thrashing RPC exhausts the budget ─────────────────────────────

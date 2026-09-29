@@ -21,7 +21,6 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
   return new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
-    timeout: 15000,
   });
 }
 

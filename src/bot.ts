@@ -7,7 +7,7 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
-import { Bot, type Context, type CommandContext } from "grammy";
+import { Bot, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 
 import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
@@ -25,43 +25,27 @@ import {
   type AuditFileSummary,
   type AuditLog,
 } from "./audit.js";
-import {
-  AUDIT_CLI_HINT,
-  COMMAND_DESCRIPTIONS,
-  HELP_INTRO,
-  HELP_TITLE,
-  PAUSE_MESSAGES,
-  RESUME_MESSAGES,
-} from "./i18n.js";
 
-/** Shared metadata for handlers, help, and Telegram's command menu. */
-const COMMANDS = [
-  { command: "start", description: COMMAND_DESCRIPTIONS.start, operatorOnly: false },
-  { command: "help", description: COMMAND_DESCRIPTIONS.help, operatorOnly: false },
-  { command: "status", description: COMMAND_DESCRIPTIONS.status, operatorOnly: false },
-  { command: "audit", description: COMMAND_DESCRIPTIONS.audit, operatorOnly: true },
-  { command: "contracts", description: COMMAND_DESCRIPTIONS.contracts, operatorOnly: false },
-  { command: "health", description: COMMAND_DESCRIPTIONS.health, operatorOnly: false },
-  { command: "preview", description: COMMAND_DESCRIPTIONS.preview, operatorOnly: false },
-  { command: "pause", description: COMMAND_DESCRIPTIONS.pause, operatorOnly: true },
-  { command: "resume", description: COMMAND_DESCRIPTIONS.resume, operatorOnly: true },
-] as const;
-
-function visibleCommands(config?: BotConfig) {
-  return COMMANDS.filter((command) =>
-    !command.operatorOnly || config === undefined || config.operatorTelegramUserId !== null,
-  );
-}
+const HELP_BASE = [
+  "*Mimir notifier*",
+  "",
+  "I watch Mimir's two Soroban contracts on Stellar and post every new on-chain event here: claims opened, challenges staked, oracle resolutions, settlements and payouts\\.",
+  "",
+  "/status — what I am watching and how far I have read",
+  "/audit — the operator audit report, redacted and bounded (operator only)",
+  "/contracts — the contract ids I watch and where to look them up",
+  "/health — health assessment and operational readiness",
+  "/preview — preview channel notification formatting",
+  "/help — this message",
+];
 
 function helpMessage(config: BotConfig): string {
+  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
   return [
-    HELP_TITLE,
-    "",
-    escapeMd(HELP_INTRO),
-    "",
-    ...visibleCommands(config).map(({ command, description }) =>
-      escapeMd(`/${command} — ${description}`),
-    ),
+    ...HELP_BASE.slice(0, -1),
+    "/pause — operator only: pause scheduling new scans",
+    "/resume — operator only: resume polling now",
+    HELP_BASE.at(-1) as string,
   ].join("\n");
 }
 
@@ -78,6 +62,8 @@ function ago(timestamp: number | null, nowMs: number = Date.now()): string {
   return `${Math.round(seconds / 3600)}h ago`;
 }
 
+const AUDIT_COMMAND_HINT = "See `npm run audit -- --help` for the standalone report tool.";
+
 /**
  * Render the audit report for Telegram. The report is plain text — audit lines
  * are arbitrary redacted strings and MarkdownV2 would mangle them — so nothing
@@ -87,7 +73,7 @@ function ago(timestamp: number | null, nowMs: number = Date.now()): string {
 function renderAuditForTelegram(summary: AuditFileSummary, tail: number): string {
   const header = `*Audit* — ${summary.file}`;
   const report = renderAuditReport(summary, { tail });
-  return `${header}\n\n${report}\n\n${AUDIT_CLI_HINT}`;
+  return `${header}\n\n${report}\n\n${AUDIT_COMMAND_HINT}`;
 }
 
 function cursorPreview(cursor: string | null): string {
@@ -113,7 +99,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
     `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
-    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped} · deduped ${status.eventsDeduplicated ?? 0}` +
+    `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}` +
       (status.notificationsDropped
         ? ` · dropped during shutdown ${status.notificationsDropped}`
         : ""),
@@ -136,11 +122,6 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${cursorPreview(target.cursor)}\``,
     );
-    if (target.cursorStalled) {
-      lines.push(
-        `  cursor stalled: unchanged for ${target.cyclesWithoutAdvance} successful cycles while behind tip`,
-      );
-    }
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
   }
 
@@ -203,13 +184,6 @@ export function healthMessage(
       `  last event ledger: ${target.lastEventLedger ?? "none seen"}`,
       `  cursor: \`${target.cursorPreview ?? "none (cold start)"}\``,
     );
-    if (target.cursorStale) {
-      lines.push(
-        target.rewindFromLedger === null
-          ? "  ALERT: RPC rejected this cursor as stale; its position is unchanged"
-          : `  ALERT: stale cursor recovery from ledger ${target.rewindFromLedger}`,
-      );
-    }
     if (target.hasError) {
       const targetState = status.targets.find((t) => t.source === target.source);
       if (targetState?.lastError) {
@@ -266,22 +240,22 @@ export function contractsMessage(config: BotConfig): string {
 export function pauseMessage(result: PollerPauseResult): string {
   switch (result) {
     case "paused":
-      return PAUSE_MESSAGES.paused;
+      return "*Polling paused*\nThe current scan may finish, but no new cycle will start\\. Cursors were not changed\\.";
     case "already-paused":
-      return PAUSE_MESSAGES.alreadyPaused;
+      return "*Polling is already paused*";
     case "stopped":
-      return PAUSE_MESSAGES.stopped;
+      return "*Polling cannot pause* — the process is stopping\\.";
   }
 }
 
 export function resumeMessage(result: PollerResumeResult): string {
   switch (result) {
     case "resumed":
-      return RESUME_MESSAGES.resumed;
+      return "*Polling resumed*\nThe next scan starts now\\. Cursors were not changed\\.";
     case "already-running":
-      return RESUME_MESSAGES.alreadyRunning;
+      return "*Polling is already running*";
     case "stopped":
-      return RESUME_MESSAGES.stopped;
+      return "*Polling cannot resume* — the process is stopping\\.";
   }
 }
 
@@ -328,99 +302,93 @@ const AUDIT_TAIL = 10;
 export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   const { config, status, pause, resume } = deps;
 
-  const handlers: Record<typeof COMMANDS[number]["command"], (ctx: CommandContext<Context>) => Promise<void>> = {
-    start: async (ctx) => {
-      await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
-    },
+  bot.command("start", async (ctx) => {
+    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+  });
 
-    help: async (ctx) => {
-      await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
-    },
+  bot.command("help", async (ctx) => {
+    await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
+  });
 
-    status: async (ctx) => {
-      if (!isChatAllowed(config.allowedChatIds, ctx.chat.id)) {
-        // Silently ignore requests from unapproved chats. Responding with an
-        // error would leak the existence of the restriction; not responding at
-        // all is consistent with privacy-mode bots that simply never see most
-        // messages. Log so operators can diagnose misconfigured chat ids.
-        console.warn(
-          `[bot] /status denied for chat ${ctx.chat.id} (not in ALLOWED_CHAT_IDS)`,
-        );
-        return;
-      }
-      await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
-    },
+  bot.command("status", async (ctx) => {
+    if (!isChatAllowed(config.allowedChatIds, ctx.chat.id)) {
+      // Silently ignore requests from unapproved chats. Responding with an
+      // error would leak the existence of the restriction; not responding at
+      // all is consistent with privacy-mode bots that simply never see most
+      // messages. Log so operators can diagnose misconfigured chat ids.
+      console.warn(
+        `[bot] /status denied for chat ${ctx.chat.id} (not in ALLOWED_CHAT_IDS)`,
+      );
+      return;
+    }
+    await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+  });
 
-    audit: async (ctx) => {
-      if (!isOperator(ctx, config)) {
-        // Same authorization model as /pause and /resume: the report is only
-        // meant for the operator, so other users get silence, not an error that
-        // would confirm the command exists. The standalone `npm run audit` CLI
-        // is the credential-free path for anyone with machine access.
-        console.warn(`[bot] ignored unauthorized /audit on update ${ctx.update.update_id}`);
-        return;
-      }
-      try {
-        const file = deps.auditFile ?? config.auditFile;
-        const summary = await readAuditFile(file);
+  bot.command("audit", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      // Same authorization model as /pause and /resume: the report is only
+      // meant for the operator, so other users get silence, not an error that
+      // would confirm the command exists. The standalone `npm run audit` CLI
+      // is the credential-free path for anyone with machine access.
+      console.warn(`[bot] ignored unauthorized /audit on update ${ctx.update.update_id}`);
+      return;
+    }
+    try {
+      const file = deps.auditFile ?? config.auditFile;
+      const summary = await readAuditFile(file);
 
-        // The in-memory window also holds entries recorded since the last flush;
-        // append any of those the file does not already contain (same entries
-        // serialise identically) so the report is current without duplicates.
-        const seen = new Set(summary.entries.map((e) => JSON.stringify(e)));
-        const live = (deps.audit ? deps.audit.tail(AUDIT_TAIL) : []).filter(
-          (e) => !seen.has(JSON.stringify(e)),
-        );
+      // The in-memory window also holds entries recorded since the last flush;
+      // append any of those the file does not already contain (same entries
+      // serialise identically) so the report is current without duplicates.
+      const seen = new Set(summary.entries.map((e) => JSON.stringify(e)));
+      const live = (deps.audit ? deps.audit.tail(AUDIT_TAIL) : []).filter(
+        (e) => !seen.has(JSON.stringify(e)),
+      );
 
-        const merged: AuditFileSummary = {
-          ...summary,
-          entries: [...summary.entries, ...live].slice(-AUDIT_REPORT_MAX_ENTRIES),
-        };
-        await ctx.reply(renderAuditForTelegram(merged, AUDIT_TAIL), {
-          link_preview_options: { is_disabled: true },
-        });
-      } catch (err) {
-        await ctx.reply(`Audit report failed: ${safeErrorMessage(err, [config.botToken])}`);
-      }
-    },
+      const merged: AuditFileSummary = {
+        ...summary,
+        entries: [...summary.entries, ...live].slice(-AUDIT_REPORT_MAX_ENTRIES),
+      };
+      await ctx.reply(renderAuditForTelegram(merged, AUDIT_TAIL), {
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err) {
+      await ctx.reply(`Audit report failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
 
-    // Config-only, so this never fails on account of poller or RPC state —
-    // unlike /status, it has nothing to report failure on.
-    health: async (ctx) => {
-      await ctx.reply(healthMessage(config, status()), TELEGRAM_OPTIONS);
-    },
+  // Config-only, so this never fails on account of poller or RPC state —
+  // unlike /status, it has nothing to report failure on.
+  bot.command("health", async (ctx) => {
+    await ctx.reply(healthMessage(config, status()), TELEGRAM_OPTIONS);
+  });
 
-    contracts: async (ctx) => {
-      await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
-    },
+  bot.command("contracts", async (ctx) => {
+    await ctx.reply(contractsMessage(config), TELEGRAM_OPTIONS);
+  });
 
-    preview: async (ctx) => {
-      const text = ctx.message?.text ?? "";
-      const spaceIndex = text.indexOf(" ");
-      const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
-      await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
-    },
+  bot.command("preview", async (ctx) => {
+    const text = ctx.message?.text ?? "";
+    const spaceIndex = text.indexOf(" ");
+    const arg = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
+    await ctx.reply(previewMessage(config, arg || "market"), TELEGRAM_OPTIONS);
+  });
 
-    pause: async (ctx) => {
-      if (!isOperator(ctx, config)) {
-        console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
-        return;
-      }
-      await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
-    },
+  bot.command("pause", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      console.warn(`[bot] ignored unauthorized /pause on update ${ctx.update.update_id}`);
+      return;
+    }
+    await ctx.reply(pauseMessage(pause()), TELEGRAM_OPTIONS);
+  });
 
-    resume: async (ctx) => {
-      if (!isOperator(ctx, config)) {
-        console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
-        return;
-      }
-      await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
-    },
-  };
-
-  for (const { command } of COMMANDS) {
-    bot.command(command, handlers[command]);
-  }
+  bot.command("resume", async (ctx) => {
+    if (!isOperator(ctx, config)) {
+      console.warn(`[bot] ignored unauthorized /resume on update ${ctx.update.update_id}`);
+      return;
+    }
+    await ctx.reply(resumeMessage(resume()), TELEGRAM_OPTIONS);
+  });
 }
 
 export function createBot(deps: BotDeps): Bot {
@@ -529,10 +497,7 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       // text, tokens, or remote payloads.
       console.warn(
         `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(
-            err,
-            typeof config.botToken === "string" ? [config.botToken] : [],
-          )}`,
+          `retrying as plain text: ${safeErrorMessage(err)}`,
       );
       await bot.api.sendMessage(chatId, fallback, {
         ...PLAIN_TEXT_OPTIONS,
@@ -543,9 +508,19 @@ export function createNotifier(bot: Bot, config: BotConfig) {
 }
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
-export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
+export async function registerCommands(bot: Bot): Promise<void> {
   try {
-    await bot.api.setMyCommands(visibleCommands(config).map(({ command, description }) => ({ command, description })));
+    await bot.api.setMyCommands([
+      { command: "start", description: "What this bot does" },
+      { command: "help", description: "Show help" },
+      { command: "status", description: "Last-seen ledger and watched contracts" },
+      { command: "audit", description: "Operator audit report (redacted, bounded)" },
+      { command: "contracts", description: "Contract ids and explorer links" },
+      { command: "health", description: "Health assessment and operational readiness" },
+      { command: "preview", description: "Preview channel notification formatting" },
+      { command: "pause", description: "Operator only: pause new scans" },
+      { command: "resume", description: "Operator only: resume polling now" },
+    ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over, and never log an unbounded API error.
     console.warn(`[bot] setMyCommands failed: ${safeErrorMessage(err)}`);

@@ -12,9 +12,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
-import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
-import { redactText } from "./redact.js";
 
 export interface HealthDeps {
   config: BotConfig;
@@ -90,12 +88,6 @@ export interface HealthReport {
       cursorPreview: string | null;
       /** Ledger a target is resuming from after a floor rewind, or null. */
       rewindFromLedger: number | null;
-      /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
-      cursorStale: boolean;
-      /** Successful cycles with an unchanged cursor while behind the tip. */
-      cyclesWithoutAdvance: number;
-      /** Cursor unchanged for {@link CURSOR_STALL_CYCLES} cycles while behind tip. */
-      cursorStalled: boolean;
       hasError: boolean;
     }>;
   };
@@ -189,16 +181,12 @@ export function buildHealthReport(
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
-    const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
-    // A stalled cursor is a live fault the failure counters cannot see: every
-    // cycle succeeds, it just never makes progress.
-    const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
     const hasEverSucceeded = poller.lastSuccessAt !== null;
     const stale =
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
+    status = tooManyFailures || stale ? "degraded" : "ok";
   }
 
   return {
@@ -228,10 +216,7 @@ export function buildHealthReport(
       cursorRewinds: poller.cursorRewinds ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
-        ? {
-            at: new Date(poller.lastError.at).toISOString(),
-            message: redactText(poller.lastError.message),
-          }
+        ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
         : null,
       pendingFlush: poller.pendingFlush === true,
       lastFlushAt: iso(poller.lastFlushAt ?? null),
@@ -241,9 +226,6 @@ export function buildHealthReport(
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
         rewindFromLedger: typeof t.rewindFromLedger === "number" ? t.rewindFromLedger : null,
-        cursorStale: t.cursorStale === true,
-        cursorStalled: t.cursorStalled === true,
-        cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
     },
@@ -317,7 +299,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
   server.on("error", (err) => {
-    console.error(`[health] server error: ${safeErrorMessage(err)}`);
+    console.error(`[health] server error: ${err instanceof Error ? err.message : err}`);
   });
 
   server.listen(config.healthPort, config.healthHost);
