@@ -27,6 +27,7 @@ import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
 import { boundText } from "./status.js";
+import { redactUrl, registerSecrets } from "./redact.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -94,6 +95,11 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  // Register this process's secrets before anything can fail: every
+  // operator-facing error goes through the scrubber, so a call site cannot
+  // leak the token or the chat id by forgetting to pass them.
+  registerSecrets([config.botToken, config.chatId]);
+
   // The mock profile exists for the dry-run entry, not this one: warn loudly
   // so a profile left set in a deployment is noticed before Telegram rejects
   // the placeholder token.
@@ -106,7 +112,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`[boot] Mimir Telegram notifier`);
-  console.log(`[boot] network      ${networkLabel(config)} (${config.rpcUrl})`);
+  console.log(`[boot] network      ${networkLabel(config)} (${redactUrl(config.rpcUrl)})`);
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
@@ -176,7 +182,7 @@ async function main(): Promise<void> {
   // so a deploy probe can see the process even while grammy is connecting.
   const healthServer = startHealthServer({ config, status: () => poller.status() });
 
-  await registerCommands(bot);
+  await registerCommands(bot, config);
 
   // Lock first: refuse a second live instance before Telegram long-polling starts.
   // That keeps a duplicate process from racing the cursor or fighting getUpdates.

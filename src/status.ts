@@ -76,6 +76,8 @@ export interface StatusTargetSnapshot {
    * A bounded ledger number, never a cursor, token, or remote payload.
    */
   rewindFromLedger: number | null;
+  /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
+  cursorStale: boolean;
   lastError: string | null;
   consecutiveFailures: number;
   nextEligibleAt: number | null;
@@ -101,6 +103,8 @@ export interface StatusSnapshot {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Suppressed by the bounded dedup window as already-processed. */
+  eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
   cursorRewinds: number;
   consecutiveFailures: number;
@@ -135,6 +139,7 @@ export function buildStatusSnapshot(
     notificationsSent: status.notificationsSent,
     notificationsFailed: status.notificationsFailed,
     eventsSkipped: status.eventsSkipped,
+    eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,
     lastError: status.lastError
@@ -147,6 +152,7 @@ export function buildStatusSnapshot(
       lastEventLedger: target.lastEventLedger,
       rewindFromLedger:
         typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
+      cursorStale: target.cursorStale === true,
       lastError: target.lastError === null ? null : boundText(target.lastError),
       consecutiveFailures: target.consecutiveFailures ?? 0,
       nextEligibleAt: target.nextEligibleAt ?? null,
