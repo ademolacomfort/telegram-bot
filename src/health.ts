@@ -285,6 +285,11 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
 
+    if (deps.webhookHandler && method === "POST" && url.pathname === "/telegram-webhook") {
+      deps.webhookHandler(req, res);
+      return;
+    }
+
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
       const report = buildHealthReport(config, status(), now(), provenance());
       sendJson(res, report.ok ? 200 : 503, report);

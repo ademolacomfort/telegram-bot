@@ -7,8 +7,11 @@
  * state. All chain logic lives in `src/poller.ts` and `src/stellar/`.
  */
 
+import type { UserFromGetMe } from "grammy/types";
+import { Bot, type Context } from "grammy";
 import { Bot, type Context, type CommandContext } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
+import { performance } from "node:perf_hooks";
 
 import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
 import { formatFeatureFlags } from "./notifications/featureFlags.js";
@@ -53,6 +56,8 @@ function visibleCommands(config?: BotConfig) {
   );
 }
 
+export function helpMessage(config: BotConfig): string {
+  if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
 function helpMessage(config: BotConfig): string {
   return [
     HELP_TITLE,
@@ -65,7 +70,7 @@ function helpMessage(config: BotConfig): string {
   ].join("\n");
 }
 
-const TELEGRAM_OPTIONS = {
+export const TELEGRAM_OPTIONS = {
   parse_mode: "MarkdownV2" as const,
   link_preview_options: { is_disabled: true },
 };
@@ -147,6 +152,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
   if (status.lastError) {
     lines.push(
       "",
+      `Last error \\(${ago(status.lastError.at)}\\): ${escapeMd(clipError(status.lastError.message))}`,
       `Last error \\(${ago(status.lastError.at, nowMs)}\\): ${escapeMd(status.lastError.message)}`,
     );
   }
@@ -288,6 +294,8 @@ export function resumeMessage(result: PollerResumeResult): string {
 export interface BotDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  pause: () => PollerPauseResult;
+  resume: () => PollerResumeResult;
   /** Live in-memory audit window; renders immediately even before a flush. */
   audit?: AuditLog | undefined;
   /** Where the audit JSONL file lives, for the file-backed report. */
@@ -299,6 +307,11 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+}
+
+function isOperator(ctx: Context, config: BotConfig): boolean {
+  const operatorId = config.operatorTelegramUserId;
+  return operatorId !== null && ctx.from?.id.toString() === operatorId;
 }
 
 /**
@@ -325,8 +338,13 @@ function isOperator(ctx: Context, config: BotConfig): boolean {
 const AUDIT_TAIL = 10;
 
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
-export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
-  const { config, status, pause, resume } = deps;
+export function registerCommandHandlers(
+  bot: Bot | { command: (name: string, handler: (ctx: Context) => Promise<void>) => void },
+  deps: BotDeps,
+): void {
+  const { config, status } = deps;
+  const pause = deps.pause ?? (() => "stopped");
+  const resume = deps.resume ?? (() => "stopped");
 
   const handlers: Record<typeof COMMANDS[number]["command"], (ctx: CommandContext<Context>) => Promise<void>> = {
     start: async (ctx) => {
@@ -348,7 +366,17 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
         );
         return;
       }
-      await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+      const startedAt = performance.now();
+      let sent = false;
+      try {
+        await ctx.reply(statusMessage(config, status()), TELEGRAM_OPTIONS);
+        sent = true;
+      } finally {
+        const latencyMs = Math.max(0, performance.now() - startedAt);
+        console.info(
+          `[bot] /status ${sent ? "sent" : "failed"} in ${latencyMs.toFixed(1)}ms`,
+        );
+      }
     },
 
     audit: async (ctx) => {
@@ -424,8 +452,13 @@ export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
 }
 
 export function createBot(deps: BotDeps): Bot {
+  const bot = new Bot(
+    deps.config.botToken,
+    deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined,
+  );
   const bot = new Bot(deps.config.botToken, deps.botInfo !== undefined ? { botInfo: deps.botInfo } : undefined);
   registerCommandHandlers(bot, deps);
+  registerCallbackHandlers(bot, deps);
 
   // grammy rethrows handler errors by default, which would take the process
   // with it. Keep Telegram/RPC error text bounded and redact known secrets.
@@ -453,6 +486,12 @@ export interface SendExtra {
    * Bounded identifiers for fallback logging only. Optional; never sent.
    */
   eventRef?: { eventId?: string | undefined; ledger?: number | undefined; source?: string | undefined } | undefined;
+  /**
+   * Post the notification as a reply to this message, for chats that thread
+   * their notifications. Optional: omitted from the payload entirely when
+   * absent, so the send is byte-identical to the unthreaded one.
+   */
+  replyToMessageId?: number | undefined;
 }
 
 /**
@@ -517,6 +556,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, text, {
         ...TELEGRAM_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
       return;
     } catch (err) {
@@ -537,6 +579,9 @@ export function createNotifier(bot: Bot, config: BotConfig) {
       await bot.api.sendMessage(chatId, fallback, {
         ...PLAIN_TEXT_OPTIONS,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(extra?.replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          : {}),
       });
     }
   };

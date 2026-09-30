@@ -114,6 +114,8 @@ looks healthy but notifies nobody.
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
 | `/resume` | Operator only. Schedules the next poll cycle immediately, without changing or replaying cursors |
+| `npm run cursor -- backup` | Backs up the validated cursor file without contacting Stellar or Telegram |
+| `npm run cursor -- restore --from PATH` | Restores a validated backup while holding the poller lock; replacing an existing cursor requires `--force` |
 
 `/start`, `/help`, and Telegram's command menu are generated from the same
 command metadata used to register handlers. Without `OPERATOR_TELEGRAM_USER_ID`,
@@ -179,6 +181,40 @@ npm start -- --status          # or: node dist/index.js --status
 safe to run from a health check or a cron job while the bot is running. It exits
 `0` when a snapshot was read and `1` when there is none or it is not valid JSON.
 
+## Cursor backup and restore
+
+The offline cursor command uses `CURSOR_FILE` from the environment or `.env`
+(default `data/cursor.json`). Backups default to a timestamped sibling file;
+choose another persistent location with `--out`. A backup is a point-in-time,
+byte-preserving copy of a supported current or legacy cursor file and does not
+pause polling. It is written atomically and is never overwritten unless
+`--force` is supplied. Run `npm run build` before using the command in a local
+checkout; the Docker image already includes the compiled CLI.
+
+```bash
+npm run cursor -- backup
+npm run cursor -- backup --out /safe-storage/cursor-before-deploy.json
+npm run cursor -- restore --from /safe-storage/cursor-before-deploy.json --force
+```
+
+Restore validates and normalizes the backup to the current version-1 cursor
+format, takes `INSTANCE_LOCK_FILE` (default `data/poller.lock`) to prevent the
+bot from starting or writing concurrently, and atomically replaces the live
+file. Stop the bot before restoring. A live process holding the lock makes the
+command fail; stale locks are handled by the same PID check used at startup.
+Restoring an existing cursor requires `--force`; malformed or future-version
+files are always rejected. The command prints only paths, schema version, and
+target count, never opaque cursor contents.
+
+Keep backups on persistent storage separate from the deployment's writable
+cursor when possible. On Railway, a one-off command must use the same attached
+`/app/data` volume (or an explicitly mounted backup location). The runtime
+Docker image contains the CLI through the normal TypeScript build. A rollback
+to an older bot release remains compatible with the version-1 cursor format;
+preserve the backup until the restored release has resumed polling. The chain
+remains the source of truth: a backup restores reader position and dedup state,
+not missed notifications or on-chain events.
+
 **What is deliberately not in it.** The snapshot is built from an allowlist of
 fields, so nothing can leak by accident. It never contains the bot token, a
 private key, or a payment proof. The chat id is redacted to its sign and last
@@ -201,6 +237,13 @@ The chain reader runs standalone. Testnet's Soroban RPC is public and
 unauthenticated, so this needs nothing but the contract ids:
 
 ```bash
+npm run scan                         # both contracts, from the RPC's retained floor
+npm run scan -- --pages 40           # walk further
+npm run scan -- --show 20            # print 20 decoded events per contract
+npm run scan -- --from 4226500       # explicit start ledger
+npm run scan -- --contract market    # scan only the market contract
+npm run scan -- --contract squad     # scan only the squad contract
+npm run scan -- --help               # show usage
 npm run scan                     # both contracts, from the RPC's retained floor
 npm run scan -- --pages 40       # walk further
 npm run scan -- --show 20        # print 20 decoded events per contract
@@ -259,7 +302,14 @@ poller's cursor.
 
 **Bounded output.** Admin events (`oracle_changed`, `ownership_transferred`, …)
 are logged at the progress level and not sent. Unknown or malformed events are
-logged and skipped. Send failures are counted as skipped and do not abort the
+logged and skipped. Send failures are retried on the next cycle; each individual
+Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default 15000) so a
+stalled or rate-limited Telegram endpoint cannot wedge the poller. A send that
+exceeds the timeout is counted as a failure, logged with the target and event
+name (never the token or payload), and the cursor is not advanced past it, so
+the event is retried after a restart. Cursor files remain version-1 and
+compatible with existing deployments; no configuration change is required to
+keep current behavior.ailures are counted as skipped and do not abort the
 run. No bot token or private key ever appears in progress output or the JSON
 report.
 
@@ -632,6 +682,11 @@ non-object `targets` map), the poller renames it to
 for debugging and prevents the next `saveCursors` from silently overwriting
 evidence of the failure.
 
+The `version` field is checked on load. A file with a missing or unrecognised
+version is treated as a cold start (warning logged) rather than silently
+misread. This protects against reading a file written by a future release after
+a downgrade.
+
 **Deployment note:** a flat file is fine for v0 but it must survive restarts. On
 an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
@@ -658,6 +713,24 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
 - **A failed RPC call** fails one contract's scan for one cycle. Its cursor is
   left untouched, so the next cycle resumes exactly where it stopped.
+- **A failed Telegram send** drops one message; the cursor still advances. That
+  is deliberate: holding the cursor back would turn a revoked token or a chat
+  the bot was removed from into an infinite replay, and recovery would flood the
+  channel. Notifications are lossy on purpose — the chain is the record.
+- **A corrupt cursor file** is treated as a cold start rather than a crash.
+- **A cursor file with a missing or unrecognised `version` field** is treated as
+  a cold start; a warning is logged with instructions to delete the file.
+- **A stale cursor** — one pointing to a ledger more than ~10 % of the
+  retention window behind `oldestLedger` — causes a warning that names the
+  cursor file, the gap size, and how to recover. Events in the gap are already
+  gone from the RPC and will not be posted.
+- **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle. A
+  single warning is logged when the cap is hit, and the cursor still advances.
+  Telegram's rate limiter is never the thing that takes the bot down.
+- **Consecutive full-cycle failures** are counted. A structured warning is
+  emitted the first time the count crosses 5, 10, 25, 50, or 100 consecutive
+  failed cycles, naming the RPC URL, the last error, and confirming the cursor
+  is intact.
 - **A partial notification batch** commits the opaque RPC cursor after the
   returned page has been processed. Unknown events, events beyond
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
@@ -821,6 +894,12 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
+**Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
+```bash
+npm run healthcheck
+# or: node dist/healthcheck.js
+```
+
 The JSON body is operational status only: poller counters, ledgers, truncated
 cursors, whether a target has an error, automatic floor rewinds
 (`poller.cursorRewinds` plus each target's `rewindFromLedger`), and the chain
@@ -977,6 +1056,9 @@ truth for IaC; follow Railway's migration guide when the time comes.
 
 ## Development checks
 
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build and all
+tests (format, config validation, and poller behaviour — no live Testnet or Telegram
+credentials required), or `npm run build` to produce the production output.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 Run `npm run seed:cursor` to write a local cursor fixture.
 
@@ -1003,7 +1085,7 @@ files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
 Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile, config-provenance, health, lockfile and audit-trail suites (including deterministic fuzz cases; `npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
-Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md).
+Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Issue and pull-request templates (`.github/ISSUE_TEMPLATE/`, `.github/pull_request_template.md`) capture the failure-mode, cursor-safety, and deployment-impact details every change must describe.
 
 ## License
 
